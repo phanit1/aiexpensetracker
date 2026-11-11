@@ -26,7 +26,8 @@ const sample = (userId) => {
 };
 app.use(cors()); app.use(express.json({ limit: '1mb' }));
 let databaseInitialization;
-app.use((_req, _res, next) => {
+app.use((req, _res, next) => {
+  if (req.path === '/api/health') return next();
   databaseInitialization ||= initStandaloneSchema().then(seedDemoAccount);
   databaseInitialization.then(() => next()).catch(next);
 });
@@ -72,7 +73,18 @@ const apiInfo = (_req, res) => res.json({
 });
 app.get('/', apiInfo);
 app.get('/api', apiInfo);
-app.get('/api/health', (_req, res) => res.json({ ok: true, storage: pool ? 'postgres' : 'demo', demoAccount: Boolean(pool && process.env.NODE_ENV !== 'production') }));
+app.get('/api/health', async (_req, res) => {
+  if (!pool) return res.status(503).json({ ok: false, storage: 'in-memory demo', database: 'not configured', message: 'Set DATABASE_URL in the Vercel project environment variables.' });
+  try {
+    databaseInitialization ||= initStandaloneSchema().then(seedDemoAccount);
+    await databaseInitialization;
+    await pool.query('select 1');
+    res.json({ ok: true, storage: 'postgres', database: 'connected' });
+  } catch (error) {
+    console.error('Database health check failed:', error);
+    res.status(503).json({ ok: false, storage: 'postgres', database: 'unavailable', message: 'Check DATABASE_URL and the Vercel Function Logs.' });
+  }
+});
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { name, email, password, currency = 'USD' } = req.body; if (!name || !email || !password || password.length < 6) return res.status(400).json({ error: 'Enter your name, a valid email, and a password of at least 6 characters.' });
