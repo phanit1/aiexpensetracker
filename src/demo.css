@@ -1,0 +1,12 @@
+.auth-page.has-demo .auth-switch::after {
+  content: "Local preview login: demo@expenseai.app  /  ExpenseAI123!";
+  display: block;
+  margin-top: 17px;
+  padding: 10px 12px;
+  border: 1px solid #eee8fa;
+  border-radius: 9px;
+  color: #766995;
+  background: #fbf9ff;
+  font-size: 9px;
+  line-height: 1.5;
+}
