@@ -1,45 +1,32 @@
 # ExpenseAI
 
-A full stack personal expense tracker built with React, Express, and PostgreSQL. It uses one server side `DATABASE_URL` for persistent user accounts and financial data. The API handles password hashing with bcrypt and sessions with JWT; no Supabase Auth client or API keys are used.
+A full-stack personal expense tracker built with React, Express, and Supabase. Supabase Auth manages accounts and the Supabase Data API stores financial data. The app uses a publishable key with authenticated user sessions; it does not need a Postgres connection string or a server secret key.
 
-## Get started
+## Setup
 
 Requirements: Node.js 20 or newer and npm.
 
-1. Copy `.env.example` to `.env` or add `DATABASE_URL` and a long random `JWT_SECRET` to your existing `.env`.
-2. Run `npm install`, then `npm run dev`.
-3. Open the Vite URL shown in the terminal (normally `http://localhost:5173`).
+1. In Supabase, open **Project Settings → API** and copy the Project URL and publishable key.
+2. Add `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` to `.env` locally and to the Vercel project's environment variables. Never put a secret/service-role key in the browser.
+3. In Supabase **SQL Editor**, run [`database/schema.sql`](database/schema.sql) once. It creates the ExpenseAI tables, including `expenseai_users` for account profiles, and grants access to authenticated users. A trigger creates or updates each profile from Supabase Auth; the API filters records by the signed-in user's ID.
+4. Run `npm install`, then `npm run dev` and open the Vite URL (normally `http://localhost:5173`).
 
-The Express API starts on port 4000 and creates the required PostgreSQL tables on startup. Visit `http://localhost:4000/` for API status and endpoint information. The app uses in-memory demo storage if `DATABASE_URL` is unset; data in that mode resets when the server restarts.
+Supabase Auth email confirmation is controlled in the Supabase Auth settings. If confirmation is enabled, signup displays a prompt to verify the email before signing in. For a quick local setup, you can disable email confirmation in the Supabase Auth provider settings.
 
-## PostgreSQL
+## Vercel deployment
 
-Set `DATABASE_URL` to a PostgreSQL connection string. A hosted PostgreSQL provider can be used by supplying its direct or pooler connection string; no provider specific URL or anon key is needed. You can apply [`database/schema.sql`](database/schema.sql) manually, though the API creates these tables when it starts:
+Set `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` for the Production environment. Add `GEMINI_API_KEY` only if you want Gemini generated insights. Run the SQL setup before testing signup, then deploy or redeploy. `/api/health` confirms the Supabase Auth API is reachable; authenticated data requests additionally require the SQL schema.
 
-- `app_users` stores email, display name, currency, and bcrypt password hash.
-- `categories`, `transactions`, and `budgets` store user owned financial data.
-- `insights` stores AI insight payloads as JSONB.
-
-On startup, the API also adjusts the financial tables for server-managed JWT authentication. Existing accounts from a previous managed-auth setup must create a new app account; the local preview account is available for exploring the UI.
-
-There are no preset production login credentials. For a local preview with `DATABASE_URL` configured, use **demo@expenseai.app** / **ExpenseAI123!**. On first startup outside production, the API seeds this account with 20 transactions and three budgets. You can also choose **Create your account** for a separate persistent account. The preview account is disabled when `NODE_ENV=production`.
-
-## AI insights
-
-Without `GEMINI_API_KEY`, the API generates rule based monthly summaries and savings ideas from the user's transaction history. To enable Gemini, set `GEMINI_API_KEY` and optionally `GEMINI_MODEL` in `.env`. Keep these values on the API server, never in `VITE_*` variables.
+**Security note:** RLS is intentionally disabled per project preference. The app's Express API filters records by user ID, but anyone with a valid Supabase user session can call the Supabase Data API directly and access rows across accounts. Do not use this configuration with real financial data; enable RLS and per-user policies before production.
 
 ## Included
 
-- JWT and bcrypt authentication.
+- Supabase Auth signup, login, and access-token refresh.
 - Seventeen default income and expense categories, plus custom categories with icon and color choices.
 - Create, edit, delete, search, and filter transactions.
 - Import bank and credit card statements from CSV, TSV, OFX, QFX, or text-based PDF; review and correct inferred transactions and categories before saving, with duplicate detection. Scanned image-only PDFs require OCR and are not supported.
 - Weekly and monthly category budgets with current spending progress.
 - Dashboard summary cards, income and expense trends, spending breakdown, recent transactions, and budgets.
 - 30 day, 3 month, monthly, and yearly transaction charts.
-- Monthly AI reflection, savings tips, and a filter aware transaction analyzer.
+- Monthly AI reflection, savings tips, and a filter aware transaction analyzer. Without `GEMINI_API_KEY`, the API generates local rule-based summaries and tips.
 - Responsive desktop and mobile layouts.
-
-## Production
-
-Set `NODE_ENV=production`, configure `.env`, run `npm run build`, then `npm start`. The Express server serves the built React app and API from the same origin.
