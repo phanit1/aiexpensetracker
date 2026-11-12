@@ -171,6 +171,17 @@ app.put('/api/transactions/:id', auth, async (req, res) => {
   try { const { type, amount, category_id, description, notes = '', date } = req.body; const rows = await supa(rest(tables.transactions, `id=eq.${encodeURIComponent(req.params.id)}&user_id=eq.${encodeURIComponent(req.user.id)}&select=id`), { token: req.accessToken, method: 'PATCH', body: { type, amount, category_id: category_id || null, description, notes, transaction_date: date }, prefer: 'return=representation' }); if (!rows.length) return res.sendStatus(404); res.json({ ok: true }); }
   catch (error) { console.error(error); json(res, error); }
 });
+app.delete('/api/transactions/bulk', auth, async (req, res) => {
+  try {
+    const ids = [...new Set(Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [])];
+    if (!ids.length || ids.length > 500 || ids.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) {
+      return res.status(400).json({ error: 'Select between 1 and 500 valid transactions.' });
+    }
+    const filter = `id=in.(${ids.map(encodeURIComponent).join(',')})&user_id=eq.${encodeURIComponent(req.user.id)}&select=id`;
+    const deleted = await supa(rest(tables.transactions, filter), { token: req.accessToken, method: 'DELETE', prefer: 'return=representation' });
+    res.json({ deleted: Array.isArray(deleted) ? deleted.length : 0 });
+  } catch (error) { console.error(error); json(res, error); }
+});
 app.delete('/api/transactions/:id', auth, async (req, res) => { try { await supa(rest(tables.transactions, `id=eq.${encodeURIComponent(req.params.id)}&user_id=eq.${encodeURIComponent(req.user.id)}`), { token: req.accessToken, method: 'DELETE' }); res.sendStatus(204); } catch (error) { json(res, error); } });
 
 app.post('/api/categories', auth, async (req, res) => {
