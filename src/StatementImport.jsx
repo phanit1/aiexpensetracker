@@ -25,7 +25,20 @@ async function imageCanvas(file) {
 }
 
 async function readStatement(file, password = '', onProgress = () => {}, forceOcr = false) {
-  if (/\.(xlsx?|xlsm)$/i.test(file.name)) {
+  const extension = file.name.toLowerCase();
+  const signature = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+  const isOleFile = signature.length >= 4 && signature[0] === 0xd0 && signature[1] === 0xcf && signature[2] === 0x11 && signature[3] === 0xe0;
+  const isZip = signature.length >= 2 && signature[0] === 0x50 && signature[1] === 0x4b;
+  const signatureText = new TextDecoder().decode(signature);
+  const isImage = file.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|tif|tiff|gif)$/i.test(extension) ||
+    signature[0] === 0x89 && signatureText.slice(1, 4) === 'PNG' ||
+    signature[0] === 0xff && signature[1] === 0xd8 && signature[2] === 0xff ||
+    signatureText.slice(0, 3) === 'GIF' || signatureText.slice(0, 2) === 'BM' ||
+    signatureText.slice(0, 4) === 'RIFF' && signatureText.slice(8, 12) === 'WEBP' ||
+    signature[0] === 0x49 && signature[1] === 0x49 && signature[2] === 0x2a && signature[3] === 0 ||
+    signature[0] === 0x4d && signature[1] === 0x4d && signature[2] === 0 && signature[3] === 0x2a;
+  const isSpreadsheet = /\.(xlsx?|xlsm|xlsb|ods)$/i.test(extension) || /application\/(vnd\.ms-excel|vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet|vnd\.oasis\.opendocument\.spreadsheet)/i.test(file.type) || isOleFile || isZip;
+  if (isSpreadsheet) {
     onProgress('Opening spreadsheet…');
     const XLSX = await import('xlsx');
     const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: true });
@@ -37,11 +50,17 @@ async function readStatement(file, password = '', onProgress = () => {}, forceOc
     });
     return transactionSheet || sheets[0];
   }
-  if (/\.(png|jpe?g|webp|bmp)$/i.test(file.name)) {
+  if (isImage) {
     onProgress('Preparing image for text recognition…');
-    return recognizeImage(await imageCanvas(file), onProgress);
+    return { text: await recognizeImage(await imageCanvas(file), onProgress), image: true };
   }
-  if (!/\.pdf$/i.test(file.name)) return file.text();
+  const isPdf = /\.pdf$/i.test(extension) || file.type === 'application/pdf' || new TextDecoder().decode(signature.slice(0, 5)) === '%PDF-';
+  if (!isPdf) {
+    const text = await file.text();
+    const controls = (text.match(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g) || []).length;
+    if (controls > Math.max(4, text.length * 0.01)) throw new Error('This looks like a binary file type the importer cannot read yet. Export it as CSV, Excel, PDF, OFX, or QIF.');
+    return text;
+  }
   const [pdfjs, worker] = await Promise.all([
     import('pdfjs-dist'),
     import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
@@ -59,6 +78,7 @@ async function readStatement(file, password = '', onProgress = () => {}, forceOc
     throw error;
   }
   const pages = [];
+  const positionedPages = [];
   let ocrWorker;
   let ocrPageNumber = 0;
   try {
@@ -67,13 +87,16 @@ async function readStatement(file, password = '', onProgress = () => {}, forceOc
     const page = await pdfDocument.getPage(pageNumber);
     const content = await page.getTextContent();
     const lines = [];
+    const positionedItems = [];
     for (const item of content.items) {
       if (!('str' in item) || !item.str.trim()) continue;
       const y = Math.round(item.transform[5]);
+      positionedItems.push({ x: item.transform[4], y, width: item.width, text: item.str.trim() });
       let line = lines.find((candidate) => Math.abs(candidate.y - y) <= 2);
       if (!line) { line = { y, items: [] }; lines.push(line); }
       line.items.push({ x: item.transform[4], text: item.str.trim() });
     }
+    positionedPages.push(positionedItems);
     let pageText = lines.sort((a, b) => b.y - a.y).map((line) => line.items.sort((a, b) => a.x - b.x).map((item) => item.text).join(' ')).join('\n');
     if (forceOcr || pageText.replace(/\W/g, '').length < 120) {
       ocrPageNumber = pageNumber;
@@ -98,7 +121,7 @@ async function readStatement(file, password = '', onProgress = () => {}, forceOc
     if (ocrWorker) await ocrWorker.terminate();
     await pdfDocument.destroy();
   }
-  return pages.join('\n');
+  return { text: pages.join('\n'), pdfPages: positionedPages };
 }
 
 export default function StatementImport({ close, auth, data, notify }) {
@@ -106,6 +129,8 @@ export default function StatementImport({ close, auth, data, notify }) {
   const [statementType, setStatementType] = useState('bank');
   const [sourceFile, setSourceFile] = useState(null);
   const [sourceText, setSourceText] = useState('');
+  const [sourcePdfPages, setSourcePdfPages] = useState(null);
+  const [sourceIsImage, setSourceIsImage] = useState(false);
   const [rows, setRows] = useState([]);
   const [filename, setFilename] = useState('');
   const [pdfPassword, setPdfPassword] = useState('');
@@ -121,25 +146,28 @@ export default function StatementImport({ close, auth, data, notify }) {
   const loadFile = async (file, password = '') => {
     if (!file) return;
     if (!password) { setPasswordRequired(false); setPdfPassword(''); }
-    setError(''); setResult(null); setRows([]); setFilename(file.name); setSourceFile(file);
-    if (file.size > 5 * 1024 * 1024) { setError('This statement is over 5 MB. Export a smaller date range and try again.'); setSourceFile(null); return; }
-    if (!/\.(csv|tsv|ofx|qfx|pdf|png|jpe?g|webp|bmp|xlsx?|xlsm)$/i.test(file.name)) {
-      setError('Please upload CSV, TSV, OFX, QFX, PDF, Excel, or image statements.');
-      return;
-    }
+    setError(''); setResult(null); setRows([]); setFilename(file.name); setSourceFile(file); setSourcePdfPages(null);
+    if (file.size > 20 * 1024 * 1024) { setError('This statement is over 20 MB. Export a smaller date range and try again.'); setSourceFile(null); return; }
     try {
       setProcessing(true); setProgress('Reading statement…');
-      let text = await readStatement(file, password, setProgress);
+      let extracted = await readStatement(file, password, setProgress);
+      let text = typeof extracted === 'string' ? extracted : extracted.text;
+      const pdfPages = typeof extracted === 'string' ? null : extracted.pdfPages;
+      const isPdf = Array.isArray(pdfPages);
+      const isImage = Boolean(extracted?.image) || file.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|tif|tiff|gif)$/i.test(file.name);
+      setSourcePdfPages(pdfPages);
+      setSourceIsImage(isImage);
       setSourceText(text);
       let parsed;
-      const isImage = /\.(png|jpe?g|webp|bmp)$/i.test(file.name);
-      try { parsed = parseStatement(text, file.name, statementType, categories, { ocr: isImage }); }
+      try { parsed = parseStatement(text, file.name, statementType, categories, { ocr: isImage, pdf: isPdf, pdfPages }); }
       catch (initialError) {
-        if (!/\.pdf$/i.test(file.name) || initialError.name === 'PasswordException') throw initialError;
+        if (!isPdf || initialError.name === 'PasswordException') throw initialError;
         setProgress('Text extraction was incomplete. Trying OCR on each PDF page…');
-        text = await readStatement(file, password, setProgress, true);
+        extracted = await readStatement(file, password, setProgress, true);
+        text = extracted.text;
+        setSourcePdfPages(extracted.pdfPages);
         setSourceText(text);
-        parsed = parseStatement(text, file.name, statementType, categories);
+        parsed = parseStatement(text, file.name, statementType, categories, { pdf: true, pdfPages: extracted.pdfPages });
       }
       setRows(parsed);
       setPasswordRequired(false); setPdfPassword('');
@@ -152,7 +180,7 @@ export default function StatementImport({ close, auth, data, notify }) {
   const chooseStatementType = async (nextType) => {
     setStatementType(nextType);
     if (!sourceFile || !rows.length) return;
-    try { setRows(parseStatement(sourceText, sourceFile.name, nextType, categories, { ocr: /\.(png|jpe?g|webp|bmp)$/i.test(sourceFile.name) })); }
+    try { setRows(parseStatement(sourceText, sourceFile.name, nextType, categories, { ocr: sourceIsImage, pdf: Boolean(sourcePdfPages), pdfPages: sourcePdfPages })); }
     catch (parseError) { setError(parseError.message); }
   };
 
@@ -191,11 +219,11 @@ export default function StatementImport({ close, auth, data, notify }) {
           <button className={statementType === 'bank' ? 'selected' : ''} onClick={() => chooseStatementType('bank')}><ArrowDownLeft size={15}/> Bank account</button>
           <button className={statementType === 'card' ? 'selected' : ''} onClick={() => chooseStatementType('card')}><ArrowUpRight size={15}/> Credit card</button>
         </div>
-        <input ref={inputRef} className="statement-file-input" type="file" accept=".csv,.tsv,.ofx,.qfx,.pdf,.xls,.xlsx,.xlsm,.png,.jpg,.jpeg,.webp,.bmp,text/csv,text/tab-separated-values,application/x-ofx,application/pdf,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,image/*" onChange={(event) => { loadFile(event.target.files?.[0]); event.target.value = ''; }}/>
+        <input ref={inputRef} className="statement-file-input" type="file" accept=".csv,.tsv,.ofx,.ofc,.qfx,.qif,.mt940,.sta,.dat,.pdf,.xls,.xlsx,.xlsm,.xlsb,.ods,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.gif,.json,.xml,.txt,.html,.htm,*/*" onChange={(event) => { loadFile(event.target.files?.[0]); event.target.value = ''; }}/>
         <button className={`statement-dropzone ${rows.length ? 'has-file' : ''}`} disabled={processing} onClick={() => inputRef.current?.click()}>
           <span className="statement-upload-icon">{processing ? <span className="loading-spinner"/> : rows.length ? <Check size={20}/> : <Upload size={20}/>}</span>
           <b>{filename || 'Choose a statement to get started'}</b>
-          <span>{processing ? progress : rows.length ? `${rows.length} transactions ready to review` : 'CSV, TSV, OFX, QFX, PDF, Excel, or image - up to 5 MB'}</span>
+          <span>{processing ? progress : rows.length ? `${rows.length} transactions ready to review` : 'CSV, Excel, PDF, QIF, OFX, XML, HTML, or image statement - up to 20 MB'}</span>
           {!processing && <span className="statement-browse">Browse files <ArrowRight size={13}/></span>}
         </button>
         {passwordRequired && <div className="statement-password-box">

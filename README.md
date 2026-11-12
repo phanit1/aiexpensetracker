@@ -24,7 +24,7 @@ Set `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` for the Production environment
 - Supabase Auth signup, login, and access-token refresh.
 - Seventeen default income and expense categories, plus custom categories with icon and color choices.
 - Create, edit, delete, search, and filter transactions.
-- Import bank and credit card statements from CSV, TSV, OFX, QFX, XLS, XLSX, PDF, and common image formats. Scanned PDFs and images use browser-based OCR; review and correct extracted transactions and categories before importing, with duplicate detection. OCR accuracy depends on scan quality and statement layout.
+- Import bank and credit card statements from CSV/TSV, OFX/OFC/QFX, QIF, MT940, CAMT XML, JSON, HTML tables, XLS/XLSX/XLSM/XLSB/ODS, PDF, and common image formats (PNG/JPEG/WebP/BMP/TIFF/GIF). The importer detects spreadsheet and PDF signatures when extensions are missing, and uses browser-based OCR for scanned PDFs and images. Bank layouts vary; review and correct every extracted row and suggested category before importing. No importer can guarantee perfect extraction from every proprietary format or low-quality scan.
 - Weekly and monthly category budgets with current spending progress.
 - Dashboard summary cards, income and expense trends, spending breakdown, recent transactions, and budgets.
 - 30 day, 3 month, monthly, and yearly transaction charts.
