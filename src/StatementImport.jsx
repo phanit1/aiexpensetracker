@@ -4,16 +4,52 @@ import { parseStatement } from './statementParser.js';
 
 const currencyText = (amount, currency) => new Intl.NumberFormat(undefined, { style: 'currency', currency, maximumFractionDigits: 2 }).format(amount || 0);
 
-async function readStatement(file, password = '') {
+async function recognizeImage(source, onProgress) {
+  const { createWorker } = await import('tesseract.js');
+  const worker = await createWorker('eng', 1, { logger: (message) => {
+    if (message.status === 'recognizing text') onProgress(`Reading image text… ${Math.round((message.progress || 0) * 100)}%`);
+  } });
+  try { return (await worker.recognize(source)).data.text; }
+  finally { await worker.terminate(); }
+}
+
+async function imageCanvas(file) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, 3000 / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  canvas.getContext('2d', { willReadFrequently: true }).drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return canvas;
+}
+
+async function readStatement(file, password = '', onProgress = () => {}, forceOcr = false) {
+  if (/\.(xlsx?|xlsm)$/i.test(file.name)) {
+    onProgress('Opening spreadsheet…');
+    const XLSX = await import('xlsx');
+    const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: true });
+    const sheets = workbook.SheetNames.map((name) => XLSX.utils.sheet_to_csv(workbook.Sheets[name], { blankrows: false, dateNF: 'yyyy-mm-dd' })).filter((text) => text.trim());
+    if (!sheets.length) throw new Error('This spreadsheet has no readable rows.');
+    const transactionSheet = sheets.find((text) => {
+      const headerText = text.split(/\r?\n/).slice(0, 15).join(' ').toLowerCase();
+      return /date/.test(headerText) && /description|details|merchant|payee|transaction|narrative|memo/.test(headerText) && /amount|debit|credit|withdraw|deposit|value/.test(headerText);
+    });
+    return transactionSheet || sheets[0];
+  }
+  if (/\.(png|jpe?g|webp|bmp)$/i.test(file.name)) {
+    onProgress('Preparing image for text recognition…');
+    return recognizeImage(await imageCanvas(file), onProgress);
+  }
   if (!/\.pdf$/i.test(file.name)) return file.text();
   const [pdfjs, worker] = await Promise.all([
     import('pdfjs-dist'),
     import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
   ]);
   pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
-  let document;
+  let pdfDocument;
   try {
-    document = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), ...(password ? { password } : {}) }).promise;
+    pdfDocument = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), ...(password ? { password } : {}) }).promise;
   } catch (error) {
     if (error.name === 'PasswordException') {
       const passwordError = new Error(password ? 'That password did not unlock the PDF. Check it and try again.' : 'This PDF is password protected. Enter its password to continue.');
@@ -23,8 +59,12 @@ async function readStatement(file, password = '') {
     throw error;
   }
   const pages = [];
-  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
-    const page = await document.getPage(pageNumber);
+  let ocrWorker;
+  let ocrPageNumber = 0;
+  try {
+  for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
+    onProgress(`Reading PDF page ${pageNumber} of ${pdfDocument.numPages}…`);
+    const page = await pdfDocument.getPage(pageNumber);
     const content = await page.getTextContent();
     const lines = [];
     for (const item of content.items) {
@@ -34,9 +74,30 @@ async function readStatement(file, password = '') {
       if (!line) { line = { y, items: [] }; lines.push(line); }
       line.items.push({ x: item.transform[4], text: item.str.trim() });
     }
-    pages.push(lines.sort((a, b) => b.y - a.y).map((line) => line.items.sort((a, b) => a.x - b.x).map((item) => item.text).join(' ')).join('\n'));
+    let pageText = lines.sort((a, b) => b.y - a.y).map((line) => line.items.sort((a, b) => a.x - b.x).map((item) => item.text).join(' ')).join('\n');
+    if (forceOcr || pageText.replace(/\W/g, '').length < 120) {
+      ocrPageNumber = pageNumber;
+      onProgress(`Recognizing scanned page ${pageNumber} of ${pdfDocument.numPages}…`);
+      ocrWorker ||= await (async () => {
+        const { createWorker } = await import('tesseract.js');
+        return createWorker('eng', 1, { logger: (message) => {
+          if (message.status === 'recognizing text') onProgress(`Recognizing scanned page ${ocrPageNumber} of ${pdfDocument.numPages}… ${Math.round((message.progress || 0) * 100)}%`);
+        } });
+      })();
+      const viewport = page.getViewport({ scale: Math.min(2.4, 3000 / page.getViewport({ scale: 1 }).width) });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      await page.render({ canvas, canvasContext: context, viewport }).promise;
+      pageText = (await ocrWorker.recognize(canvas)).data.text;
+      canvas.width = 0; canvas.height = 0;
+    }
+    pages.push(pageText);
   }
-  await document.destroy();
+  } finally {
+    if (ocrWorker) await ocrWorker.terminate();
+    await pdfDocument.destroy();
+  }
   return pages.join('\n');
 }
 
@@ -49,6 +110,8 @@ export default function StatementImport({ close, auth, data, notify }) {
   const [filename, setFilename] = useState('');
   const [pdfPassword, setPdfPassword] = useState('');
   const [passwordRequired, setPasswordRequired] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [progress, setProgress] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
@@ -60,26 +123,36 @@ export default function StatementImport({ close, auth, data, notify }) {
     if (!password) { setPasswordRequired(false); setPdfPassword(''); }
     setError(''); setResult(null); setRows([]); setFilename(file.name); setSourceFile(file);
     if (file.size > 5 * 1024 * 1024) { setError('This statement is over 5 MB. Export a smaller date range and try again.'); setSourceFile(null); return; }
-    if (!/\.(csv|tsv|ofx|qfx|pdf)$/i.test(file.name)) {
-      setError('Please upload a CSV, TSV, OFX, QFX, or PDF statement.');
+    if (!/\.(csv|tsv|ofx|qfx|pdf|png|jpe?g|webp|bmp|xlsx?|xlsm)$/i.test(file.name)) {
+      setError('Please upload CSV, TSV, OFX, QFX, PDF, Excel, or image statements.');
       return;
     }
     try {
-      const text = await readStatement(file, password);
+      setProcessing(true); setProgress('Reading statement…');
+      let text = await readStatement(file, password, setProgress);
       setSourceText(text);
-      const parsed = parseStatement(text, file.name, statementType, categories);
+      let parsed;
+      const isImage = /\.(png|jpe?g|webp|bmp)$/i.test(file.name);
+      try { parsed = parseStatement(text, file.name, statementType, categories, { ocr: isImage }); }
+      catch (initialError) {
+        if (!/\.pdf$/i.test(file.name) || initialError.name === 'PasswordException') throw initialError;
+        setProgress('Text extraction was incomplete. Trying OCR on each PDF page…');
+        text = await readStatement(file, password, setProgress, true);
+        setSourceText(text);
+        parsed = parseStatement(text, file.name, statementType, categories);
+      }
       setRows(parsed);
       setPasswordRequired(false); setPdfPassword('');
     } catch (parseError) {
       if (parseError.name === 'PasswordException') setPasswordRequired(true);
       setError(parseError.message);
-    }
+    } finally { setProcessing(false); setProgress(''); }
   };
 
   const chooseStatementType = async (nextType) => {
     setStatementType(nextType);
     if (!sourceFile || !rows.length) return;
-    try { setRows(parseStatement(sourceText, sourceFile.name, nextType, categories)); }
+    try { setRows(parseStatement(sourceText, sourceFile.name, nextType, categories, { ocr: /\.(png|jpe?g|webp|bmp)$/i.test(sourceFile.name) })); }
     catch (parseError) { setError(parseError.message); }
   };
 
@@ -118,12 +191,12 @@ export default function StatementImport({ close, auth, data, notify }) {
           <button className={statementType === 'bank' ? 'selected' : ''} onClick={() => chooseStatementType('bank')}><ArrowDownLeft size={15}/> Bank account</button>
           <button className={statementType === 'card' ? 'selected' : ''} onClick={() => chooseStatementType('card')}><ArrowUpRight size={15}/> Credit card</button>
         </div>
-        <input ref={inputRef} className="statement-file-input" type="file" accept=".csv,.tsv,.ofx,.qfx,.pdf,text/csv,text/tab-separated-values,application/x-ofx,application/pdf" onChange={(event) => { loadFile(event.target.files?.[0]); event.target.value = ''; }}/>
-        <button className={`statement-dropzone ${rows.length ? 'has-file' : ''}`} onClick={() => inputRef.current?.click()}>
-          <span className="statement-upload-icon">{rows.length ? <Check size={20}/> : <Upload size={20}/>}</span>
+        <input ref={inputRef} className="statement-file-input" type="file" accept=".csv,.tsv,.ofx,.qfx,.pdf,.xls,.xlsx,.xlsm,.png,.jpg,.jpeg,.webp,.bmp,text/csv,text/tab-separated-values,application/x-ofx,application/pdf,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,image/*" onChange={(event) => { loadFile(event.target.files?.[0]); event.target.value = ''; }}/>
+        <button className={`statement-dropzone ${rows.length ? 'has-file' : ''}`} disabled={processing} onClick={() => inputRef.current?.click()}>
+          <span className="statement-upload-icon">{processing ? <span className="loading-spinner"/> : rows.length ? <Check size={20}/> : <Upload size={20}/>}</span>
           <b>{filename || 'Choose a statement to get started'}</b>
-          <span>{rows.length ? `${rows.length} transactions ready to review` : 'CSV, TSV, OFX, QFX, or PDF - up to 5 MB'}</span>
-          <span className="statement-browse">Browse files <ArrowRight size={13}/></span>
+          <span>{processing ? progress : rows.length ? `${rows.length} transactions ready to review` : 'CSV, TSV, OFX, QFX, PDF, Excel, or image - up to 5 MB'}</span>
+          {!processing && <span className="statement-browse">Browse files <ArrowRight size={13}/></span>}
         </button>
         {passwordRequired && <div className="statement-password-box">
           <label htmlFor="statement-pdf-password">PDF password</label>

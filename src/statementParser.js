@@ -41,6 +41,11 @@ function parseDate(raw) {
     const parsedNamed = new Date(`${named[1]} ${named[2]}, ${named[3]} UTC`);
     if (!Number.isNaN(parsedNamed.getTime())) return parsedNamed.toISOString().slice(0, 10);
   }
+  const dayFirstNamed = value.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
+  if (dayFirstNamed) {
+    const parsedNamed = new Date(`${dayFirstNamed[2]} ${dayFirstNamed[1]}, ${dayFirstNamed[3]} UTC`);
+    if (!Number.isNaN(parsedNamed.getTime())) return parsedNamed.toISOString().slice(0, 10);
+  }
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
 }
@@ -93,7 +98,7 @@ function normalizeRow({ date, description, amount, type, statementType, categori
   if (!transactionDate || value == null || value === 0 || !detail) return null;
   const calendarDate = new Date(`${transactionDate}T00:00:00.000Z`);
   if (Number.isNaN(calendarDate.getTime()) || calendarDate.toISOString().slice(0, 10) !== transactionDate) return null;
-  const transactionType = type || (value < 0 ? 'income' : statementType === 'card' ? 'expense' : 'income');
+  const transactionType = type || (statementType === 'card' ? (value < 0 ? 'income' : 'expense') : (value < 0 ? 'expense' : 'income'));
   return {
     key: `${index}-${transactionDate}-${detail}`,
     date: transactionDate,
@@ -117,8 +122,8 @@ function parseOfx(text, statementType, categories) {
 
 function parsePdfText(text, statementType, categories) {
   const rows = [];
-  const datePattern = /^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s+/;
-  const amountPattern = /(?:\(?-?\$?\s*\d[\d,]*\.\d{2}\)?)/g;
+  const datePattern = /^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\s+/;
+  const amountPattern = /(?:\(?[-+]?[$€£₹]?\s*\d[\d,]*(?:\.\d{1,2})?\)?)/g;
   for (const line of text.split(/\r?\n/).map((part) => part.replace(/\s+/g, ' ').trim()).filter(Boolean)) {
     const dateMatch = line.match(datePattern);
     if (!dateMatch) continue;
@@ -132,13 +137,13 @@ function parsePdfText(text, statementType, categories) {
     const transaction = normalizeRow({ date: dateMatch[1], description, amount: amountText, statementType, categories }, rows.length);
     if (transaction) rows.push(transaction);
   }
-  if (!rows.length) throw new Error('No readable transaction rows were found in this PDF. Scanned image statements need OCR; export the statement as CSV or use a text-based PDF.');
+  if (!rows.length) throw new Error('No transaction rows could be recognized. Try a clearer scan or export the statement as CSV, OFX, or QFX.');
   return rows;
 }
 
-export function parseStatement(text, filename, statementType, categories) {
+export function parseStatement(text, filename, statementType, categories, options = {}) {
   const cleaned = text.replace(/^\uFEFF/, '').trim();
-  if (/\.pdf$/i.test(filename)) return parsePdfText(cleaned, statementType, categories);
+  if (/\.pdf$/i.test(filename) || options.ocr) return parsePdfText(cleaned, statementType, categories);
   if (/\.(ofx|qfx)$/i.test(filename) || /<OFX[\s>]/i.test(cleaned)) {
     const transactions = parseOfx(cleaned, statementType, categories);
     if (!transactions.length) throw new Error('No transactions were found in this OFX/QFX statement.');
