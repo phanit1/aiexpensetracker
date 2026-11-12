@@ -15,7 +15,7 @@ Supabase Auth email confirmation is controlled in the Supabase Auth settings. If
 
 ## Vercel deployment
 
-Set `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` for the Production environment. Add `GEMINI_API_KEY` only if you want Gemini generated insights. Run the SQL setup before testing signup, then deploy or redeploy. `/api/health` confirms the Supabase Auth API is reachable; authenticated data requests additionally require the SQL schema.
+Set `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` for the Production environment. Add `GEMINI_API_KEY` to enable Gemini statement extraction and generated insights; `GEMINI_MODEL` defaults to `gemini-3.8-flash`, and `GEMINI_EXTRACTION_MODEL` can optionally override it just for statement imports. Run the SQL setup before testing signup, then deploy or redeploy. `/api/health` confirms the Supabase Auth API is reachable; authenticated data requests additionally require the SQL schema.
 
 **Security note:** RLS is intentionally disabled per project preference. The app's Express API filters records by user ID, but anyone with a valid Supabase user session can call the Supabase Data API directly and access rows across accounts. Do not use this configuration with real financial data; enable RLS and per-user policies before production.
 
@@ -24,7 +24,7 @@ Set `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` for the Production environment
 - Supabase Auth signup, login, and access-token refresh.
 - Seventeen default income and expense categories, plus custom categories with icon and color choices.
 - Create, edit, delete, search, and filter transactions.
-- Import bank and credit card statements from CSV/TSV, OFX/OFC/QFX, QIF, MT940, CAMT XML, JSON, HTML tables, XLS/XLSX/XLSM/XLSB/ODS, PDF, and common image formats (PNG/JPEG/WebP/BMP/TIFF/GIF). The importer detects spreadsheet and PDF signatures when extensions are missing, and uses browser-based OCR for scanned PDFs and images. Bank layouts vary; review and correct every extracted row and suggested category before importing. No importer can guarantee perfect extraction from every proprietary format or low-quality scan.
+- Import bank and credit card statements from CSV/TSV, OFX/OFC/QFX, QIF, MT940, CAMT XML, JSON, HTML tables, XLS/XLSX/XLSM/XLSB/ODS, PDF, and common image formats (PNG/JPEG/WebP/BMP/TIFF/GIF). When `GEMINI_API_KEY` is configured, Gemini extracts transaction rows from the document or its locally decoded text; local format parsers remain as fallback. Documents up to about 2.5 MB can be sent as PDF/image input for multimodal extraction. Statement content may be processed by Google's Gemini API; only reviewed transactions are saved to the account. Review and correct every extracted row and suggested category before importing. No importer can guarantee perfect extraction from every proprietary format or low-quality scan.
 - Weekly and monthly category budgets with current spending progress.
 - Dashboard summary cards, income and expense trends, spending breakdown, recent transactions, and budgets.
 - 30 day, 3 month, monthly, and yearly transaction charts.

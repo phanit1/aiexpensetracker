@@ -24,6 +24,29 @@ async function imageCanvas(file) {
   return canvas;
 }
 
+async function fileAsBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return btoa(binary);
+}
+
+function mapGeminiTransactions(items, categories) {
+  const parsed = items.flatMap((item, index) => {
+    const date = String(item.date || ''), amount = Number(item.amount);
+    const parsedDate = new Date(`${date}T00:00:00.000Z`);
+    const type = item.type;
+    const description = String(item.description || '').trim().slice(0, 180);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== date || !Number.isFinite(amount) || amount <= 0 || !['income', 'expense'].includes(type) || !description) return [];
+    const category = categories.find((candidate) => candidate.type === type && candidate.name.toLowerCase() === String(item.category || '').trim().toLowerCase()) ||
+      categories.find((candidate) => candidate.type === type && candidate.name === (type === 'expense' ? 'Other Expense' : 'Other Income')) || categories.find((candidate) => candidate.type === type);
+    if (!category) return [];
+    return [{ key: `gemini-${index}-${date}`, date, amount: Math.round(amount * 100) / 100, description, type, category_id: category.id, notes: 'Extracted from statement with Gemini' }];
+  });
+  if (!parsed.length) throw new Error('Gemini did not find valid transaction rows.');
+  return parsed;
+}
+
 async function readStatement(file, password = '', onProgress = () => {}, forceOcr = false) {
   const extension = file.name.toLowerCase();
   const signature = new Uint8Array(await file.slice(0, 8).arrayBuffer());
@@ -131,6 +154,7 @@ export default function StatementImport({ close, auth, data, notify }) {
   const [sourceText, setSourceText] = useState('');
   const [sourcePdfPages, setSourcePdfPages] = useState(null);
   const [sourceIsImage, setSourceIsImage] = useState(false);
+  const [extractionMethod, setExtractionMethod] = useState('');
   const [rows, setRows] = useState([]);
   const [filename, setFilename] = useState('');
   const [pdfPassword, setPdfPassword] = useState('');
@@ -158,16 +182,35 @@ export default function StatementImport({ close, auth, data, notify }) {
       setSourcePdfPages(pdfPages);
       setSourceIsImage(isImage);
       setSourceText(text);
-      let parsed;
-      try { parsed = parseStatement(text, file.name, statementType, categories, { ocr: isImage, pdf: isPdf, pdfPages }); }
-      catch (initialError) {
-        if (!isPdf || initialError.name === 'PasswordException') throw initialError;
-        setProgress('Text extraction was incomplete. Trying OCR on each PDF page…');
-        extracted = await readStatement(file, password, setProgress, true);
-        text = extracted.text;
-        setSourcePdfPages(extracted.pdfPages);
-        setSourceText(text);
-        parsed = parseStatement(text, file.name, statementType, categories, { pdf: true, pdfPages: extracted.pdfPages });
+      let parsed, geminiError;
+      try {
+        setProgress('Gemini is reading transaction rows…');
+        const geminiImageType = file.type || (/\.jpe?g$/i.test(file.name) ? 'image/jpeg' : /\.webp$/i.test(file.name) ? 'image/webp' : /\.gif$/i.test(file.name) ? 'image/gif' : 'image/png');
+        const canSendDocument = !password && file.size <= 2_500_000 && (isPdf || isImage && /^image\/(png|jpeg|webp|gif)$/i.test(geminiImageType));
+        const geminiResult = await auth.request('/statements/extract', { method: 'POST', body: JSON.stringify({
+          fileName: file.name,
+          mimeType: isPdf ? 'application/pdf' : isImage ? geminiImageType : 'text/plain',
+          ...(canSendDocument ? { inlineBase64: await fileAsBase64(file) } : { text }),
+          statementType,
+          categories: categories.map(({ name, type }) => ({ name, type })),
+        }) });
+        parsed = mapGeminiTransactions(geminiResult.transactions || [], categories);
+        setExtractionMethod('Gemini AI');
+      } catch (error) {
+        geminiError = error;
+        setProgress('Using the local statement parser…');
+        try { parsed = parseStatement(text, file.name, statementType, categories, { ocr: isImage, pdf: isPdf, pdfPages }); }
+        catch (initialError) {
+          if (!isPdf || initialError.name === 'PasswordException') throw initialError;
+          setProgress('Text extraction was incomplete. Trying OCR on each PDF page…');
+          extracted = await readStatement(file, password, setProgress, true);
+          text = extracted.text;
+          setSourcePdfPages(extracted.pdfPages);
+          setSourceText(text);
+          parsed = parseStatement(text, file.name, statementType, categories, { pdf: true, pdfPages: extracted.pdfPages });
+        }
+        setExtractionMethod('Local parser');
+        if (geminiError?.message && !/not configured/i.test(geminiError.message)) console.warn('Gemini extraction unavailable; used local parser:', geminiError.message);
       }
       setRows(parsed);
       setPasswordRequired(false); setPdfPassword('');
@@ -231,10 +274,10 @@ export default function StatementImport({ close, auth, data, notify }) {
           <div><input id="statement-pdf-password" type="password" autoComplete="off" value={pdfPassword} onChange={(event) => setPdfPassword(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && sourceFile && loadFile(sourceFile, pdfPassword)} placeholder="Enter the password for this PDF"/><button className="button primary" disabled={!pdfPassword || busy} onClick={() => sourceFile && loadFile(sourceFile, pdfPassword)}>Unlock PDF</button></div>
           <small>The password is used only in this browser to open the file.</small>
         </div>}
-        <p className="statement-privacy"><FileSpreadsheet size={14}/> Your file is read in this browser. Only the reviewed transactions are sent to your account.</p>
+        <p className="statement-privacy"><FileSpreadsheet size={14}/> Gemini may process your statement content for extraction. Only transactions you review and import are saved to your account.</p>
         {error && <div className="auth-error statement-error">{error}</div>}
         {rows.length > 0 && <>
-          <div className="statement-review-heading"><div><span className="eyebrow">REVIEW BEFORE IMPORTING</span><b>{rows.length} rows found</b></div><button className="text-link" onClick={() => { setRows([]); setFilename(''); setResult(null); }}>Choose another file</button></div>
+          <div className="statement-review-heading"><div><span className="eyebrow">REVIEW BEFORE IMPORTING · {extractionMethod}</span><b>{rows.length} rows found</b></div><button className="text-link" onClick={() => { setRows([]); setFilename(''); setResult(null); setExtractionMethod(''); }}>Choose another file</button></div>
           <div className="statement-table-wrap"><table className="statement-table"><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Type</th><th>Category</th><th/></tr></thead><tbody>
             {rows.map((row) => <tr key={row.key}>
               <td><input aria-label="Transaction date" type="date" value={row.date} onChange={(event) => updateRow(row.key, 'date', event.target.value)}/></td>
